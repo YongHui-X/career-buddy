@@ -119,7 +119,18 @@ export function parseJobstreetItem(item, origin, fallbackCompany) {
   // Build job URL from the job ID
   const jobId = (item.id || '').trim();
   if (!jobId) return null;
-  const url = `${origin}/id/job/${jobId}`;
+  // Indonesia's public routes include the `/id` locale prefix; Singapore's
+  // routes do not (`https://sg.jobstreet.com/job/<id>`).
+  let localePrefix;
+  try {
+    const hostname = new URL(origin).hostname;
+    localePrefix = hostname === 'id.jobstreet.com' || hostname.endsWith('.jobstreet.co.id')
+      ? '/id'
+      : '';
+  } catch {
+    return null;
+  }
+  const url = `${origin}${localePrefix}/job/${jobId}`;
 
   // Validate URL hostname belongs to allowed set
   try {

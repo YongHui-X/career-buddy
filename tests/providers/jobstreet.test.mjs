@@ -43,6 +43,14 @@ try {
   }
 
   // parseJobstreetItem — uses companyName fallback when advertiser.description is absent
+  // Singapore listings do not use Indonesia's `/id` locale prefix.
+  const singaporeParsed = parseJobstreetItem(sampleItem, 'https://sg.jobstreet.com', 'FallbackCo');
+  if (singaporeParsed?.url === 'https://sg.jobstreet.com/job/92996157') {
+    pass('parseJobstreetItem uses the Singapore JobStreet route without an Indonesia locale prefix');
+  } else {
+    fail(`parseJobstreetItem Singapore URL: ${JSON.stringify(singaporeParsed)}`);
+  }
+
   const noAdvertiserItem = {
     id: '2',
     title: 'Data Scientist',
@@ -181,4 +189,3 @@ try {
 } catch (e) {
   fail(`jobstreet provider tests crashed: ${e.message}`);
 }
-
