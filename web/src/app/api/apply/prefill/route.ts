@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory } from "@/lib/career-ops";
 import { getSession } from "@/lib/apply/session";
+import { applyApiDisabled } from "@/lib/apply/api-guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -73,6 +74,7 @@ function extractJsonObject(text: string): { obj: Record<string, unknown> | null;
 // exit code/signal, parse outcome) so a stuck/empty prefill is observable on the
 // page AND written to <root>/.career-ops-web/apply-prefill.log for debugging.
 export async function POST(req: Request) {
+  const disabled = applyApiDisabled(); if (disabled) return disabled;
   let body: { sessionId?: string; cliId?: string };
   try {
     body = await req.json();

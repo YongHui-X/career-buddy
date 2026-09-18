@@ -1,4 +1,5 @@
 import { openSession } from "@/lib/apply/session";
+import { applyApiDisabled } from "@/lib/apply/api-guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,6 +10,7 @@ export const maxDuration = 300; // the agentic drive + interpretation fallbacks 
 // cliId enables the agentic fallback (the AI interprets the live form) when
 // deterministic extraction is low-confidence.
 export async function POST(req: Request) {
+  const disabled = applyApiDisabled(); if (disabled) return disabled;
   let body: { url?: string; cliId?: string; agent?: boolean; _noApplyBtn?: boolean };
   try {
     body = await req.json();

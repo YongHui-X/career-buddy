@@ -32,6 +32,18 @@ export function resolveTailoredCv(company?: string): string | null {
   return path.join(dir, matches[0]);
 }
 
+export function resolveTailoredCvArtifact(relativePath?: string): string | null {
+  if (!relativePath) return null;
+  const outputRoot = path.resolve(careerOpsRoot(), "output");
+  const candidate = path.resolve(careerOpsRoot(), relativePath);
+  if (candidate !== outputRoot && !candidate.startsWith(`${outputRoot}${path.sep}`)) return null;
+  try {
+    return fs.statSync(candidate).isFile() && candidate.toLowerCase().endsWith(".pdf") ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Best-effort company name from an application form/page title. ATS titles look
  * like "Role - Region @ Company" (Ashby) or "Company — Role" / "Role at Company".

@@ -289,6 +289,31 @@ cover_letter:
 # generate a PDF for every offer.
 # auto_pdf_score_threshold: 4.0
 
+# Unattended application automation (opt-in; disabled by default). Credentials
+# belong in environment variables or Docker secrets, never in this file.
+# automation:
+#   enabled: false
+#   mode: shadow                 # auto | shadow | canary | full
+#   browser_headless: true       # scheduled runs never display Chromium
+#   failure_notifications: digest # immediate | digest
+#   direct_ats_scan: true        # add employer-hosted ATS discovery
+#   daily_model_budget_usd: 0.25 # fail closed before a call could cross this daily ceiling
+#   min_score: 4.0
+#   max_applications_per_day: 5
+#   canary_max_per_day: 1
+#   source_cooldown_hours: 24
+#   timezone: Asia/Singapore
+#   scan_time: "07:30"
+#   digest_time: "20:00"
+#   apply_service_url: http://web:3000
+#   handoff_url: https://nas-name.tailnet.ts.net:8443
+#
+# Explicit answers the unattended worker may reuse. If a sensitive question
+# cannot be matched here, the application is quarantined for review.
+# application_answers:
+#   authorized_to_work_in_singapore: "Yes"
+#   require_sponsorship_in_singapore: "No"
+
 # ── Two-pass triage gate ────────────────────────────────────────────────────
 #
 # Used by `/career-ops pipeline`. Before running the full A-G evaluation on

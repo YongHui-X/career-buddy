@@ -1,8 +1,15 @@
-import { chromium, type Browser, type BrowserContext, type Page, type Frame, type Response } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type Page, type Frame, type Locator, type Response } from "playwright-core";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
 import { extractForm, type ApplyField, type ExtractedForm } from "./extract";
 import { parseGreenhouse, fetchGreenhouseSchema } from "./greenhouse";
-import { statusBlock, dismissConsent, tryApplyTrigger, dropNewTabs, classifyEmpty, captchaWarning, multiStepInfo, verifyFill, type ApplyIssue } from "./diagnose";
+import { statusBlock, dismissConsent, tryApplyTrigger, dropNewTabs, classifyEmpty, captchaWarning, multiStepInfo, verifyFill, verifyFillDetailed, type ApplyIssue, type FieldVerification } from "./diagnose";
 import { agentInterpretForm } from "./agent-interpret";
+import { careerOpsRoot } from "../career-ops";
+import { adapterFor, detectVendor } from "./adapters";
+import { finalSubmissionControls } from "./submit-control";
+import { attestationMatches, confirmationMatches, fileMetadataMatches } from "./receipt.mjs";
 
 /** The frame with the most interactive controls — where the agentic interpreter
  *  should look when deterministic extraction found nothing usable. */
@@ -55,6 +62,12 @@ function looksLikeApplicationForm(form: ExtractedForm): boolean {
   const hasEmail = fs.some((f) => f.type === "email" || /e-?mail/.test(lab(f)));
   const hasAppish = fs.some((f) => /first name|last name|full name|resume|résumé|\bcv\b|cover letter|phone|linkedin|github|why |portfolio|sponsorship|relocat/.test(lab(f)));
   if (hasFile || hasEmail || hasAppish) return true; // clearly an application
+  // Job-description pages can expose long lists of optional skill/favourite
+  // checkboxes. MyCareersFuture does this for every skill tag, which previously
+  // made the posting itself look like an application form and prevented us from
+  // clicking the real Apply button. A checkbox-only surface with no required or
+  // applicant-identity fields is navigation/filter UI, not an application.
+  if (fs.every((f) => f.type === "checkbox") && fs.every((f) => !f.required)) return false;
   const allSearch = fs.every(
     (f) => /search|buscar|filtr|keyword|palabra|department|departa|office|oficina|location|ubicaci|remote|category|categor/.test(lab(f)) || /filter|search|keyword/.test((f.nativeId || "").toLowerCase()),
   );
@@ -110,17 +123,50 @@ async function enrichFromAts(url: string, fields: ApplyField[]): Promise<void> {
 // so we can: extract → (user verifies pre-filled answers) → FILL the real form →
 // bringToFront() for the human to submit it themselves. Headed (channel:chrome) =
 // the user's own Chrome on their residential IP (best ATS success); never submits.
-type Session = { id: string; url: string; title: string; fields: ApplyField[]; context: BrowserContext; page: Page; frame: Frame; createdAt: number; formShot?: string };
+type Session = { id: string; url: string; title: string; fields: ApplyField[]; context: BrowserContext; page: Page; frame: Frame; createdAt: number; formShot?: string; persistent?: boolean; cvMetadata?: { name: string; size: number }; visitedSteps?: Set<string> };
 
 declare global {
   // eslint-disable-next-line no-var
   var __coApplySessions: Map<string, Session> | undefined;
   // eslint-disable-next-line no-var
   var __coHeadedBrowser: Browser | undefined;
+  var __coPersistentContext: BrowserContext | undefined;
+  var __coPersistentHeadless: boolean | undefined;
   // eslint-disable-next-line no-var
   var __coIdleTimer: ReturnType<typeof setTimeout> | undefined;
 }
 const SESSIONS: Map<string, Session> = (globalThis.__coApplySessions ??= new Map());
+
+async function persistentContext(headlessOverride?: boolean): Promise<BrowserContext> {
+  const profileDir = process.env.CAREER_OPS_BROWSER_PROFILE_DIR?.trim();
+  if (!profileDir) throw new Error("CAREER_OPS_BROWSER_PROFILE_DIR is required for authenticated discovery");
+  const headless = headlessOverride ?? process.env.CAREER_OPS_BROWSER_HEADLESS === "true";
+  let context = globalThis.__coPersistentContext;
+  if (context && globalThis.__coPersistentHeadless !== headless) {
+    await context.close().catch(() => {});
+    globalThis.__coPersistentContext = undefined;
+    context = undefined;
+  }
+  if (!context) {
+    context = await chromium.launchPersistentContext(profileDir, {
+      headless,
+      viewport: { width: 1280, height: 900 },
+      args: ["--disable-dev-shm-usage"],
+    });
+    globalThis.__coPersistentContext = context;
+    globalThis.__coPersistentHeadless = headless;
+  }
+  return context;
+}
+
+export async function openAuthenticatedLogin(url: string): Promise<void> {
+  if (!/^https:\/\//i.test(url)) throw new Error("login URL must use HTTPS");
+  const context = await persistentContext(false);
+  const pages = context.pages();
+  const page = pages.find((candidate) => candidate.url() === "about:blank") || await context.newPage();
+  await gotoResilient(page, url);
+  await page.bringToFront().catch(() => {});
+}
 
 async function headedBrowser(): Promise<Browser> {
   const b = globalThis.__coHeadedBrowser;
@@ -154,6 +200,9 @@ function scheduleIdleClose() {
       const b = globalThis.__coHeadedBrowser;
       globalThis.__coHeadedBrowser = undefined;
       void b?.close().catch(() => {});
+      const c = globalThis.__coPersistentContext;
+      globalThis.__coPersistentContext = undefined;
+      void c?.close().catch(() => {});
     }
   }, 5 * 60_000);
 }
@@ -173,15 +222,24 @@ async function nudgeScroll(page: Page): Promise<void> {
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
 }
 
-export async function openSession(url: string, cliId?: string, forceAgent?: boolean, noApplyBtn?: boolean): Promise<{ id: string; title: string; fields: ApplyField[]; shots: string[]; issues: ApplyIssue[]; needsDrive?: boolean }> {
+export async function openSession(url: string, cliId?: string, forceAgent?: boolean, noApplyBtn?: boolean): Promise<{ id: string; title: string; fields: ApplyField[]; shots: string[]; issues: ApplyIssue[]; needsDrive?: boolean; vendor: string }> {
   prune();
   if (globalThis.__coIdleTimer) clearTimeout(globalThis.__coIdleTimer); // someone's active
-  const browser = await headedBrowser();
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const profileDir = process.env.CAREER_OPS_BROWSER_PROFILE_DIR?.trim();
+  let persistent = false;
+  let context: BrowserContext;
+  if (profileDir) {
+    context = await persistentContext();
+    persistent = true;
+  } else {
+    const browser = await headedBrowser();
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  }
   context.setDefaultTimeout(8000); // no single action hangs the whole open/fill
   const page = await context.newPage();
   const abort = async (msg: string): Promise<never> => {
-    await context.close().catch(() => {});
+    if (persistent) await page.close().catch(() => {});
+    else await context.close().catch(() => {});
     if (SESSIONS.size === 0) scheduleIdleClose();
     throw new Error(msg);
   };
@@ -262,8 +320,8 @@ export async function openSession(url: string, cliId?: string, forceAgent?: bool
     if (cliId && why.code === "no-form") {
       const id = `apply-${crypto.randomUUID()}`;
       const title = form.title || (await page.title().catch(() => "")) || "Application";
-      SESSIONS.set(id, { id, url, title, fields: [], context, page, frame, createdAt: Date.now(), formShot: shots[shots.length - 1] });
-      return { id, title, fields: [], shots, issues: [], needsDrive: true };
+      SESSIONS.set(id, { id, url, title, fields: [], context, page, frame, createdAt: Date.now(), formShot: shots[shots.length - 1], persistent });
+      return { id, title, fields: [], shots, issues: [], needsDrive: true, vendor: detectVendor(page.url() || url) };
     }
     return abort(why.message);
   }
@@ -278,8 +336,53 @@ export async function openSession(url: string, cliId?: string, forceAgent?: bool
   if (unlabeled > 0) issues.push({ level: "warn", code: "unlabeled-fields", message: `${unlabeled} field${unlabeled > 1 ? "s" : ""} couldn't be labelled cleanly — double-check ${unlabeled > 1 ? "them" : "it"} before submitting.` });
 
   const id = `apply-${crypto.randomUUID()}`;
-  SESSIONS.set(id, { id, url, title: form.title, fields: form.fields, context, page, frame, createdAt: Date.now(), formShot: shots[shots.length - 1] });
-  return { id, title: form.title, fields: form.fields, shots, issues };
+  SESSIONS.set(id, { id, url, title: form.title, fields: form.fields, context, page, frame, createdAt: Date.now(), formShot: shots[shots.length - 1], persistent });
+  return { id, title: form.title, fields: form.fields, shots, issues, vendor: detectVendor(page.url() || url) };
+}
+
+export type DiscoveredBrowserJob = { url: string; title: string; company: string; location: string; source: string };
+
+/** Best-effort, sequential discovery for user-authorized logged-in job boards.
+ * It never solves challenges or follows instructions from page text; it only
+ * reads job-card links and surrounding labels. */
+export async function discoverAuthenticatedSources(sources: Array<{ name?: string; url: string }>): Promise<{ jobs: DiscoveredBrowserJob[]; failures: Array<{ source: string; reason: string }> }> {
+  const context = await persistentContext();
+  const jobs: DiscoveredBrowserJob[] = [];
+  const failures: Array<{ source: string; reason: string }> = [];
+  for (const source of sources.slice(0, 10)) {
+    const page = await context.newPage();
+    try {
+      await gotoResilient(page, source.url);
+      await page.waitForTimeout(1800);
+      const why = await classifyEmpty(page, source.url).catch(() => null);
+      if (why && ["bot-challenge", "login-wall", "auth-required"].includes(why.code)) {
+        failures.push({ source: source.name || source.url, reason: why.message });
+        continue;
+      }
+      const rows = await page.evaluate((sourceName) => {
+        const clean = (v: string | null | undefined) => (v || "").replace(/\s+/g, " ").trim();
+        const selectors = 'a[href*="/jobs/view/"],a[href*="/viewjob"],a[href*="/job-listing/"],a[href*="/job/"],a[href*="/jobs/"]';
+        const out: Array<{ url: string; title: string; company: string; location: string; source: string }> = [];
+        for (const a of Array.from(document.querySelectorAll(selectors)).slice(0, 100)) {
+          const href = (a as HTMLAnchorElement).href;
+          const title = clean(a.getAttribute("aria-label") || a.textContent);
+          if (!href || title.length < 3 || /sign in|log in|view all|saved jobs/i.test(title)) continue;
+          const card = a.closest('li,article,[class*="job-card" i],[data-job-id]');
+          const text = clean(card?.textContent);
+          const parts = text.split(/\n| · | \| /).map(clean).filter(Boolean);
+          out.push({ url: href, title, company: parts[1] || "Unknown", location: parts[2] || "", source: sourceName });
+        }
+        return out;
+      }, source.name || new URL(source.url).hostname);
+      jobs.push(...rows);
+    } catch (error) {
+      failures.push({ source: source.name || source.url, reason: error instanceof Error ? error.message.slice(0, 160) : "discovery failed" });
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+  const seen = new Set<string>();
+  return { jobs: jobs.filter((j) => { const key = j.url.split("#")[0]; if (seen.has(key)) return false; seen.add(key); return true; }), failures };
 }
 
 export function getSession(id: string): Session | undefined {
@@ -343,7 +446,8 @@ export async function finalizeDrivenSession(id: string, cliId?: string): Promise
 export async function closeSession(id: string): Promise<void> {
   const s = SESSIONS.get(id);
   SESSIONS.delete(id);
-  await s?.context.close().catch(() => {});
+  if (s?.persistent) await s.page.close().catch(() => {});
+  else await s?.context.close().catch(() => {});
   if (SESSIONS.size === 0) scheduleIdleClose();
 }
 
@@ -355,6 +459,83 @@ function isResumeField(f: ApplyField): boolean {
   return f.type === "file" && /resume|résumé|\bcv\b|curriculum|lebenslauf|currículum/i.test(f.label || "");
 }
 
+function normalizedIdentity(value: string | undefined): string {
+  return (value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+/** Resolve a control after an ATS SPA has replaced its DOM. Re-extraction tags
+ * the new controls, then identity evidence must resolve to exactly one match. */
+async function liveField(s: Session, meta: ApplyField): Promise<{ field: ApplyField; locator: Locator }> {
+  // Positional coN handles can be recycled after an upload removes its input.
+  // Native identity takes precedence; never trust a surviving positional tag.
+  if (meta.nativeId) {
+    const native = s.frame.locator(`[id="${cssAttr(meta.nativeId)}"]`);
+    if (await native.count() === 1) {
+      const id = await native.getAttribute("data-co-field");
+      if (id) return { field: { ...meta, id }, locator: native };
+    }
+  }
+
+  const refreshed = await extractForm(s.frame);
+  const sameType = refreshed.fields.filter((candidate) => candidate.type === meta.type && !!candidate.combobox === !!meta.combobox);
+  const selectors: Array<(candidate: ApplyField) => boolean> = [
+    (candidate) => !!meta.stableKey && candidate.stableKey === meta.stableKey,
+    (candidate) => !!meta.nativeName && candidate.nativeName === meta.nativeName,
+    (candidate) => !!meta.nativeId && candidate.nativeId === meta.nativeId,
+    (candidate) => normalizedIdentity(candidate.label) === normalizedIdentity(meta.label) && normalizedIdentity(candidate.section) === normalizedIdentity(meta.section),
+  ];
+  for (const matches of selectors.map((select) => sameType.filter(select))) {
+    if (matches.length !== 1) continue;
+    const field = matches[0];
+    const locator = s.frame.locator(`[data-co-field="${cssAttr(field.id)}"]`);
+    const count = await locator.count().catch(() => 0);
+    if (count === 1 || (field.type === "radio" && count > 0)) return { field, locator };
+  }
+  throw new Error(`Could not uniquely re-identify field: ${meta.label || meta.id}`);
+}
+
+/** Read-only diagnostics for a live application. No scripts supplied by callers. */
+export async function inspectSession(id: string) {
+  const s = SESSIONS.get(id);
+  if (!s) throw new Error("apply session not found or expired");
+  return {
+    title: await s.page.title(), url: s.page.url(),
+    visibleText: await s.frame.locator('body').innerText().then(text => text.slice(-6500)),
+    buttons: await s.frame.evaluate(() => Array.from(document.querySelectorAll('button, input[type="submit"]')).filter(el => (el as HTMLElement).offsetParent !== null).map(el => ({ text: el.textContent?.trim(), type: el.getAttribute('type'), markup: el.outerHTML.slice(0, 1200) }))),
+    attachments: await s.frame.evaluate(() => Array.from(document.querySelectorAll('.file-upload__filename p')).filter(el => (el as HTMLElement).offsetParent !== null).map(el => el.textContent?.trim())),
+    controls: await s.frame.evaluate(() => Array.from(document.querySelectorAll('input, select, textarea, [role="combobox"]')).filter(el => !['password', 'hidden'].includes(el.getAttribute('type') || '')).map((el) => ({
+      tag: el.tagName, id: el.id, type: el.getAttribute("type"),
+      label: el.getAttribute("aria-label"), fieldId: el.getAttribute("data-co-field"),
+    }))),
+  };
+}
+
+export async function verifySession(id: string, fields: ApplyField[], answers: Record<string, string>) {
+  const s = SESSIONS.get(id);
+  if (!s) throw new Error("apply session not found or expired");
+  const remapped = await remapForVerification(s, fields, answers);
+  return verifyFillDetailed(s.frame, remapped.fields, remapped.answers);
+}
+
+async function remapForVerification(s: Session, fields: ApplyField[], answers: Record<string, string>): Promise<{ fields: ApplyField[]; answers: Record<string, string> }> {
+  const liveFields: ApplyField[] = [];
+  const liveAnswers: Record<string, string> = {};
+  for (const meta of fields) {
+    try {
+      const live = await liveField(s, meta);
+      liveFields.push(live.field);
+      if (answers[meta.id] !== undefined) liveAnswers[live.field.id] = answers[meta.id];
+    } catch {
+      // Retain the missing original so verification reports it as unverified.
+      // Missing controls must not inherit another field's recycled coN tag.
+      const missingId = `missing-${meta.id}`;
+      liveFields.push({ ...meta, id: missingId });
+      if (answers[meta.id] !== undefined) liveAnswers[missingId] = answers[meta.id];
+    }
+  }
+  return { fields: liveFields.map(f => ({ ...f, uploadedFileName: isResumeField(f) ? s.cvMetadata?.name : undefined })), answers: liveAnswers };
+}
+
 /** Fill the real form with verified answers, screenshotting after each field.
  *  Attaches the tailored CV PDF to résumé/CV file fields (cvPath). NEVER clicks a
  *  submit/apply control — only fills/selects/checks/attaches. */
@@ -363,7 +544,7 @@ export async function fillSession(
   answers: Record<string, string>,
   fieldsMeta: ApplyField[],
   cvPath?: string,
-): Promise<{ steps: FillStep[]; navigated: boolean; issues: ApplyIssue[] }> {
+): Promise<{ steps: FillStep[]; navigated: boolean; issues: ApplyIssue[]; verification: FieldVerification[] }> {
   const s = SESSIONS.get(id);
   if (!s) throw new Error("apply session not found (it may have expired)");
   const byId = new Map(fieldsMeta.map((f) => [f.id, f]));
@@ -393,23 +574,26 @@ export async function fillSession(
   //    time; setInputFiles works even when the ATS visually hides it behind a
   //    dropzone. Other file fields (cover letter, portfolio) are left to the user.
   if (cvPath) {
+    const expectedCv = { name: path.basename(cvPath), size: fs.statSync(cvPath).size };
     for (const meta of fieldsMeta) {
       if (!isResumeField(meta)) continue;
       let ok = false;
       try {
-        await s.frame.locator(`[data-co-field="${cssAttr(meta.id)}"]`).first().setInputFiles(cvPath);
-        ok = true;
-      } catch {
-        // fallback: any file input inside the same field container
-        try {
-          await s.frame.locator(`input[type=file]`).first().setInputFiles(cvPath);
-          ok = true;
-        } catch {
-          ok = false;
-        }
-      }
+        const { locator } = await liveField(s, meta);
+        const input = locator.first();
+        const originalInput = await input.elementHandle();
+        await input.setInputFiles(cvPath);
+        const actual = await originalInput?.evaluate((el) => {
+          const file = (el as HTMLInputElement).files?.[0];
+          return file ? { name: file.name, size: file.size } : null;
+        });
+        ok = fileMetadataMatches(actual, expectedCv);
+        await originalInput?.dispose();
+      } catch { ok = false; }
       steps.push({ fieldId: meta.id, label: `${meta.label || "Resume"} (CV attached)`, ok, thumb: await shoot() });
     }
+    const resumeSteps = steps.filter((step) => /\(CV attached\)$/.test(step.label));
+    if (resumeSteps.length > 0 && resumeSteps.every((step) => step.ok)) s.cvMetadata = expectedCv;
   }
 
   for (const [fid, raw] of Object.entries(answers)) {
@@ -427,7 +611,8 @@ export async function fillSession(
     let ok = false;
     let gaveUp = false;
     try {
-      const loc = s.frame.locator(`[data-co-field="${cssAttr(fid)}"]`).first();
+      const live = await liveField(s, meta);
+      const loc = live.locator.first();
       if (meta.combobox) {
         // react-select: open, type to filter, CLICK the matching option. We never
         // press Enter — in a form, Enter can submit. Clicking an option can't.
@@ -439,19 +624,12 @@ export async function fillSession(
         });
         await s.page.waitForTimeout(300);
         const esc = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const menu = '.select__menu .select__option, .select__menu-list [role="option"], [class*="menu" i] [role="option"]';
-        const exact = s.frame.locator(menu).filter({ hasText: new RegExp(`^\\s*${esc}\\s*$`, "i") }).first();
-        if (await exact.count()) {
-          await exact.click();
-        } else {
-          // fall back to the first option that contains the typed text; else give
-          // up (Escape closes the menu) — leave it for the human, never submit.
-          const partial = s.frame.locator(menu).filter({ hasText: new RegExp(esc, "i") }).first();
-          if (await partial.count()) await partial.click();
-          else {
-            await s.page.keyboard.press("Escape").catch(() => {});
-            gaveUp = true;
-          }
+        const menu = '.select__menu .select__option, .select__menu-list [role="option"], [class*="menu" i] [role="option"], [role="listbox"] [role="option"]';
+        const exact = s.frame.locator(menu).filter({ visible: true }).filter({ hasText: new RegExp(`^\\s*${esc}(?:\\s*\\(?\\+\\d{1,4}\\)?)?\\s*$`, "i") });
+        if (await exact.count() === 1) await exact.first().click();
+        else {
+          await s.page.keyboard.press("Escape").catch(() => {});
+          gaveUp = true;
         }
       } else if (meta.type === "select") {
         await loc.selectOption({ label: value }).catch(async () => {
@@ -486,7 +664,7 @@ export async function fillSession(
         }
         gaveUp = !done;
       } else if (meta.type === "radio") {
-        const r = s.frame.locator(`[data-co-field="${cssAttr(fid)}"][data-co-option="${cssAttr(value)}"]`).first();
+        const r = s.frame.locator(`[data-co-field="${cssAttr(live.field.id)}"][data-co-option="${cssAttr(value)}"]`).first();
         await r.check({ timeout: 3000 }).catch(async () => {
           await r.check({ force: true }).catch(async () => {
             const rid = await r.getAttribute("id").catch(() => null);
@@ -495,7 +673,14 @@ export async function fillSession(
           });
         });
       } else {
-        await loc.fill(value);
+        const capability = adapterFor(s.page.url() || s.url);
+        if (capability.textEntry === "type") {
+          await loc.focus();
+          await loc.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+          await loc.pressSequentially(value, { delay: 12 });
+        } else {
+          await loc.fill(value);
+        }
       }
       ok = !gaveUp;
     } catch {
@@ -512,11 +697,77 @@ export async function fillSession(
   })();
   // Read the real form back: did every answer actually land? any validation
   // error? — so we warn the user about silent divergence before the handoff.
-  const issues = await verifyFill(s.frame, fieldsMeta, answers).catch(() => [] as ApplyIssue[]);
-  return { steps, navigated: endPath !== startPath, issues };
+  const verification = await remapForVerification(s, fieldsMeta, answers);
+  const verified = await verifyFillDetailed(s.frame, verification.fields, verification.answers).catch(() => ({
+    outcomes: verification.fields.map((field) => ({ fieldId: field.id, label: field.label, status: "unverified" as const, intended: verification.answers[field.id] })),
+    issues: [{ level: "warn" as const, code: "verification-failed", message: "Could not verify the filled form." }],
+  }));
+  return { steps, navigated: endPath !== startPath, issues: verified.issues, verification: verified.outcomes };
 }
 
-/** Hand the real (now pre-filled) form to the HUMAN to review + submit. The
+export type ApplyStepState = "form" | "review" | "complete" | "blocked";
+
+async function stepFingerprint(frame: Frame, fields: ApplyField[]): Promise<string> {
+  const progress = await frame.evaluate(() => {
+    const node = document.querySelector('[aria-current="step"], [class*="progress" i], [class*="step" i][aria-current], [data-automation-id*="progress" i]');
+    return (node?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  }).catch(() => "");
+  const raw = [frame.url(), progress, ...fields.map((field) => field.stableKey || `${field.type}:${normalizedIdentity(field.label)}`)].join("\n");
+  return createHash("sha256").update(raw).digest("hex").slice(0, 20);
+}
+
+async function hasVisibleSubmit(frame: Frame): Promise<boolean> {
+  const submit = frame.locator('button[type="submit"], input[type="submit"], button').filter({ hasText: /^\s*(submit(?: application)?|send application|complete application|finish application|apply)\s*$/i }).first();
+  return !!(await submit.count().catch(() => 0)) && await submit.isVisible().catch(() => false);
+}
+
+export async function advanceSession(id: string): Promise<{ advanced: boolean; fields: ApplyField[]; issues: ApplyIssue[]; state: ApplyStepState; stepId: string; vendor: string }> {
+  const s = SESSIONS.get(id);
+  if (!s) throw new Error("apply session not found");
+  const capability = adapterFor(s.page.url() || s.url);
+  const before = await stepFingerprint(s.frame, s.fields);
+  s.visitedSteps ??= new Set<string>();
+  s.visitedSteps.add(before);
+  if (!capability.multiStep) return { advanced: false, fields: s.fields, issues: [], state: "review", stepId: before, vendor: capability.vendor };
+  const cap = await captchaWarning(s.page).catch(() => null);
+  if (cap) return { advanced: false, fields: s.fields, issues: [cap], state: "blocked", stepId: before, vendor: capability.vendor };
+  const next = s.frame.locator('button').filter({ hasText: /^\s*(next|continue|save and continue)\s*$/i })
+    .or(s.frame.locator('input[type="button"][value="next" i], input[type="button"][value="continue" i], input[type="button"][value="save and continue" i]')).first();
+  if (!(await next.count().catch(() => 0)) || !(await next.isVisible().catch(() => false))) {
+    const state: ApplyStepState = await hasVisibleSubmit(s.frame) ? "review" : "complete";
+    return { advanced: false, fields: s.fields, issues: [], state, stepId: before, vendor: capability.vendor };
+  }
+  await next.click({ timeout: 8000 });
+  await s.page.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => {});
+  await s.page.waitForTimeout(1000);
+  const why = await classifyEmpty(s.page, s.page.url()).catch(() => null);
+  if (why && ["bot-challenge", "login-wall", "auth-required"].includes(why.code)) return { advanced: false, fields: [], issues: [why], state: "blocked", stepId: before, vendor: adapterFor(s.page.url() || s.url).vendor };
+  const current = await pickFormFrame(s.page);
+  await enrichFromAts(s.page.url() || s.url, current.form.fields);
+  const after = await stepFingerprint(current.frame, current.form.fields);
+  s.frame = current.frame;
+  s.fields = current.form.fields;
+  const issues: ApplyIssue[] = [];
+  const currentCap = await captchaWarning(s.page).catch(() => null);
+  if (currentCap) issues.push(currentCap);
+  const vendor = adapterFor(s.page.url() || s.url).vendor;
+  if (after === before) {
+    issues.push({ level: "warn", code: "step-unchanged", message: "The application did not move to a new step after Continue. Review the visible validation messages." });
+    return { advanced: false, fields: s.fields, issues, state: "blocked", stepId: after, vendor };
+  }
+  if (s.visitedSteps.has(after)) {
+    issues.push({ level: "warn", code: "step-loop", message: "The application returned to a step already seen. Automatic navigation stopped to avoid a loop." });
+    return { advanced: false, fields: s.fields, issues, state: "blocked", stepId: after, vendor };
+  }
+  s.visitedSteps.add(after);
+  if (s.fields.length === 0) {
+    const state: ApplyStepState = await hasVisibleSubmit(s.frame) ? "review" : "complete";
+    return { advanced: true, fields: [], issues, state, stepId: after, vendor };
+  }
+  return { advanced: true, fields: s.fields, issues, state: "form", stepId: after, vendor };
+}
+
+/** Hand the real (now pre-filled) form to a human for manual intervention. The
  *  window was kept OFF-SCREEN during fill, so bringToFront alone wouldn't make it
  *  visible — we reposition it on-screen via CDP first. We never submit. */
 export async function handoffSession(id: string): Promise<void> {
@@ -534,4 +785,118 @@ export async function handoffSession(id: string): Promise<void> {
     /* CDP unavailable → bringToFront still raises it */
   }
   await s.page.bringToFront().catch(() => {});
+}
+
+export type SubmitResult = {
+  status: "submitted" | "blocked" | "failed" | "submission_unknown";
+  reason?: string;
+  receipt?: { url: string; title: string; confirmation: string };
+  screenshot?: string;
+};
+
+export async function captureSession(id: string, category = "blocked"): Promise<string | undefined> {
+  const s = SESSIONS.get(id);
+  if (!s) return undefined;
+  try {
+    const dir = path.join(careerOpsRoot(), "data", "automation-screenshots");
+    fs.mkdirSync(dir, { recursive: true });
+    const safeCategory = category.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "blocked";
+    const filename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${id.slice(0, 12)}-${safeCategory}.png`;
+    const absolute = path.join(dir, filename);
+    const sensitiveControls = s.page.locator('input, textarea, select, [contenteditable="true"]');
+    const knownValues = await sensitiveControls.evaluateAll((nodes) => [...new Set(nodes.map((node) => {
+      const el = node as HTMLInputElement;
+      return String(el.value || el.textContent || "").trim();
+    }).filter((value) => value.length >= 3))]).catch(() => [] as string[]);
+    const piiText = knownValues.slice(0, 30).map((value) => s.page.getByText(value, { exact: false }));
+    await s.page.screenshot({ path: absolute, fullPage: false, mask: [sensitiveControls, ...piiText], animations: "disabled" });
+    fs.chmodSync(absolute, 0o600);
+    return path.relative(careerOpsRoot(), absolute).replace(/\\/g, "/");
+  } catch {
+    return undefined;
+  }
+}
+
+function identityMatches(haystack: string, expected: string): boolean {
+  const clean = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const h = clean(haystack);
+  const e = clean(expected);
+  // An absent or placeholder expectation cannot be verified against the page.
+  // Fail CLOSED: this runs immediately before an irreversible submit, and returning
+  // true here silently disabled the gate whenever the caller fell back to a
+  // placeholder company/role (the worker defaulted to the literal 'Unknown').
+  if (!e || e === "unknown") return false;
+  if (h.includes(e)) return true;
+  const tokens = e.split(" ").filter((t) => t.length >= 4 && !["engineer", "developer", "analyst", "manager", "senior", "junior"].includes(t));
+  return tokens.length > 0 && tokens.every((t) => h.includes(t));
+}
+
+/** Submit a fully verified session for the unattended worker. This is deliberately
+ * separate from fillSession: a caller cannot accidentally submit by asking to
+ * fill. It fails closed on challenges, attestations, identity mismatches, empty
+ * required fields, and any visible validation issue. */
+export async function submitSession(
+  id: string,
+  answers: Record<string, string>,
+  fields: ApplyField[],
+  expectedCompany: string,
+  expectedRole: string,
+): Promise<SubmitResult> {
+  const s = SESSIONS.get(id);
+  if (!s) return { status: "failed", reason: "apply session not found or expired" };
+  const stop = async (status: SubmitResult["status"], reason: string, receipt?: SubmitResult["receipt"]): Promise<SubmitResult> => ({
+    status, reason, receipt, screenshot: await captureSession(id, status),
+  });
+
+  const cap = await captchaWarning(s.page).catch(() => null);
+  if (cap) return stop("blocked", cap.message);
+  const adapter = adapterFor(s.page.url() || s.url);
+  if (!adapter.submission) return stop("blocked", `${adapter.vendor} is discovery-only; automatic submission requires an employer-hosted supported ATS`);
+  if (!s.cvMetadata) return stop("blocked", "No browser-verified tailored CV upload is present in this application session");
+  const attestation = fields.find((f) => f.required && attestationMatches(f.label || ""));
+  if (attestation) return stop("blocked", `Required attestation needs human confirmation: ${attestation.label}`);
+
+  const pageIdentity = await s.page.evaluate(() => `${document.title}\n${(document.body?.innerText || "").slice(0, 6000)}`).catch(() => s.title);
+  if (!identityMatches(pageIdentity, expectedCompany) || !identityMatches(pageIdentity, expectedRole)) {
+    const unverifiable = !expectedCompany?.trim() || !expectedRole?.trim()
+      || /^unknown$/i.test(expectedCompany.trim()) || /^unknown$/i.test(expectedRole.trim());
+    return stop("blocked", unverifiable
+      ? "Expected company or role is missing or a placeholder, so page identity cannot be verified before submitting"
+      : "Visible company or role does not match the evaluated application");
+  }
+
+  const remapped = await remapForVerification(s, fields, answers);
+  const verification = await verifyFill(s.frame, remapped.fields, remapped.answers).catch(() => [{ level: "warn", code: "verification-failed", message: "Could not verify the filled form" } as ApplyIssue]);
+  const blocking = verification.filter((x) => x.level !== "info");
+  if (blocking.length) return stop("blocked", blocking.map((x) => x.message).join("; "));
+
+  // A job header's "Apply" button often only scrolls to the form. Never count
+  // that navigation control as a submission attempt.
+  const submit = finalSubmissionControls(s.frame);
+  if (await submit.count().catch(() => 0) !== 1 || !(await submit.isEnabled().catch(() => false))) {
+    return stop("blocked", "No unambiguous visible Submit control was found");
+  }
+
+  try {
+    await submit.click({ timeout: 8000 });
+  } catch (error) {
+    return stop("submission_unknown", `Submit initiation became ambiguous: ${error instanceof Error ? error.message.slice(0, 120) : "unknown error"}`);
+  }
+  await s.page.waitForLoadState("domcontentloaded", { timeout: 12_000 }).catch(() => {});
+  await s.page.waitForTimeout(2500);
+  const challenge = await s.page.locator('body').innerText().catch(() => "");
+  if (/verification code was sent|enter the .{0,25}code to confirm|check your email.{0,80}code/i.test(challenge)) {
+    return stop("blocked", "Email verification required: enter the code sent by the employer to complete this application. No submission receipt yet.");
+  }
+  const receipt = await s.page.evaluate(() => ({
+    url: location.href,
+    title: document.title,
+    confirmation: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 1200),
+  })).catch(() => ({ url: s.page.url(), title: "", confirmation: "" }));
+
+  if (confirmationMatches(receipt.confirmation) || confirmationMatches(receipt.title)) {
+    await closeSession(id);
+    return { status: "submitted", receipt };
+  }
+  return stop("submission_unknown", "Submit was clicked but no reliable confirmation receipt was detected; automatic retry is disabled", receipt);
 }

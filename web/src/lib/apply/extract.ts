@@ -11,6 +11,10 @@ export type ApplyField = {
   combobox?: boolean; // react-select-style widget → fill via click+type+Enter, not selectOption
   nativeId?: string; // the live element's id/name — used to match ATS API schemas (Greenhouse)
   nativeName?: string;
+  ariaLabel?: string;
+  stableKey?: string; // survives SPA re-renders; never used unless it identifies one control
+  section?: string;
+  uploadedFileName?: string; // server-verified upload, used when ATS removes the input
 };
 
 export type ExtractedForm = { title: string; url: string; fields: ApplyField[] };
@@ -124,7 +128,16 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
       const tag = el.tagName.toLowerCase();
       const itype = ((el as HTMLInputElement).type || "").toLowerCase();
       if (tag === "input" && ["hidden", "submit", "button", "image", "reset"].includes(itype)) continue;
-      if ((el as HTMLElement).offsetParent === null && itype !== "radio" && itype !== "checkbox") continue;
+      // File inputs and custom radio/checkbox inputs are often visually hidden
+      // behind a visible label/dropzone. Keep those only while their wrapper is
+      // visible; this avoids carrying fields from a hidden earlier wizard step.
+      const wrappingLabel = (el as Element).closest("label") as HTMLElement | null;
+      const labelTarget = (el as HTMLElement).id ? document.querySelector(`label[for="${CSS.escape((el as HTMLElement).id)}"]`) as HTMLElement | null : null;
+      const reachable = (el as HTMLElement).offsetParent !== null ||
+        (!!wrappingLabel && wrappingLabel.offsetParent !== null) ||
+        (!!labelTarget && labelTarget.offsetParent !== null) ||
+        (["radio", "checkbox", "file"].includes(itype) && (el.parentElement as HTMLElement | null)?.offsetParent !== null);
+      if (!reachable) continue;
       // skip ATS "autofill from resume / parse my CV" helper widgets (Ashby) — these
       // are convenience uploaders, not real application fields.
       if ((el as Element).closest('[class*="autofill" i]')) continue;
@@ -139,11 +152,19 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
       const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true";
       const nativeId = (el as HTMLElement).id || undefined;
       const nativeName = (el as HTMLInputElement).name || undefined;
+      const ariaLabel = el.getAttribute("aria-label") || undefined;
+      const sectionNode = el.closest("fieldset, section, [role=group], [class*=section i]");
+      const section = clean(sectionNode?.querySelector("legend, h2, h3, h4, [class*=title i]")?.textContent) || undefined;
       const fid = `co${n++}`;
+      const identity = (type: string, label: string) => {
+        const norm = (v: string | undefined) => (v || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        return [type, norm(nativeName), norm(nativeId), norm(ariaLabel), norm(label), norm(section)].join("|");
+      };
 
       if (isCombobox) {
         el.setAttribute("data-co-field", fid);
-        fields.push({ id: fid, type: "select", combobox: true, label: clean(labelFor(el)), required, options: [], nativeId, nativeName });
+        const label = clean(labelFor(el));
+        fields.push({ id: fid, type: "select", combobox: true, label, required, options: [], nativeId, nativeName, ariaLabel, section, stableKey: identity("select", label) });
         continue;
       }
 
@@ -160,7 +181,8 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
           r.setAttribute("data-co-field", fid);
           r.setAttribute("data-co-option", options[i] ?? String(i));
         });
-        fields.push({ id: fid, type: "radio", label: clean(groupLabel(el, options)) || name, required, options });
+        const label = clean(groupLabel(el, options)) || name;
+        fields.push({ id: fid, type: "radio", label, required, options, nativeId, nativeName, ariaLabel, section, stableKey: identity("radio", label) });
         continue;
       }
 
@@ -168,20 +190,25 @@ export async function extractForm(ctx: Page | Frame): Promise<ExtractedForm> {
 
       if (tag === "select") {
         const options = Array.from((el as HTMLSelectElement).options).map((o) => clean(o.textContent)).filter((o) => o && !/^(select|choose|--)/i.test(o));
-        fields.push({ id: fid, type: "select", label: clean(labelFor(el)), required, options, nativeId, nativeName });
+        const label = clean(labelFor(el));
+        fields.push({ id: fid, type: "select", label, required, options, nativeId, nativeName, ariaLabel, section, stableKey: identity("select", label) });
         continue;
       }
       const type = tag === "textarea" ? "textarea" : ["email", "tel", "url", "number", "date", "checkbox", "file"].includes(itype) ? itype : "text";
       const ml = (el as HTMLInputElement).maxLength;
+      const label = clean(labelFor(el));
       fields.push({
         id: fid,
         type,
-        label: clean(labelFor(el)),
+        label,
         required,
         maxLength: ml && ml > 0 ? ml : undefined,
         value: (el as HTMLInputElement).value || undefined,
         nativeId,
         nativeName,
+        ariaLabel,
+        section,
+        stableKey: identity(type, label),
       });
     }
     return { title: document.title, fields };

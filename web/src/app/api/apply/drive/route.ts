@@ -1,6 +1,7 @@
 import { getSession, finalizeDrivenSession, extractCurrent, isApplicationFormFn, handoffSession } from "@/lib/apply/session";
 import { driveSession } from "@/lib/apply/drive";
 import { classifyEmpty } from "@/lib/apply/diagnose";
+import { applyApiDisabled } from "@/lib/apply/api-guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,6 +11,7 @@ export const maxDuration = 300;
 // REACH a fillable application form (the user watches each step live), then we
 // extract + finalize. NEVER submits (enforced in driveSession).
 export async function POST(req: Request) {
+  const disabled = applyApiDisabled(); if (disabled) return disabled;
   let body: { sessionId?: string; cliId?: string; goal?: "reach" | "full"; answers?: { label: string; value: string }[] };
   try {
     body = await req.json();

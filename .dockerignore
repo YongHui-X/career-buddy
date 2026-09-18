@@ -14,3 +14,13 @@ reports/*.md
 *.log
 .DS_Store
 writing-samples
+secrets
+cv.md
+article-digest.md
+portals.yml
+config/profile.yml
+modes/_profile.md
+modes/_custom.md
+data
+documents
+interview-prep

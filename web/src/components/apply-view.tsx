@@ -220,12 +220,17 @@ export function ApplyView() {
             </div>
           )}
           {done && (
-            <div className="co-rise mt-4 flex items-start gap-2.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm backdrop-blur-sm">
-              <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-500" />
-              <div>
-                <span className="font-medium text-emerald-700 dark:text-emerald-400">The real form is now in front, pre-filled.</span>{" "}
-                <span className="text-muted">Review it and click Submit yourself — career-ops never submits for you.</span>
+            <div className="co-rise mt-4 space-y-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm backdrop-blur-sm">
+              <div className="flex items-start gap-2.5">
+                <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-500" />
+                <div>
+                  <span className="font-medium text-emerald-700 dark:text-emerald-400">The current form step is in front, pre-filled.</span>{" "}
+                  <span className="text-muted">Review it. If the site has another step, continue from here; submit the final application yourself.</span>
+                </div>
               </div>
+              {a.canAdvance && <button onClick={a.advance} className="ml-7 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-300">
+                <ArrowUpRight className="size-3.5" /> Continue to next step
+              </button>}
             </div>
           )}
         </div>

@@ -121,24 +121,18 @@ export async function tryApplyTrigger(page: Page): Promise<boolean> {
 /** When extraction yields 0 fields, classify WHY so we abort with the RIGHT
  *  message (bot-challenge vs login wall vs closed posting vs unsupported). */
 export async function classifyEmpty(page: Page, url: string): Promise<ApplyIssue> {
-  const host = (() => {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return "";
-    }
-  })();
   const sig = await page
     .evaluate(() => {
       const t = (document.title || "").toLowerCase();
       const body = (document.body?.innerText || "").toLowerCase().slice(0, 6000);
       const hasPassword = !!document.querySelector('input[type="password"]');
+      const hasMfa = !!document.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="verification" i]');
       const challengeDom = !!document.querySelector(
         '#challenge-running, #challenge-form, .cf-browser-verification, iframe[src*="challenges.cloudflare.com"], .g-recaptcha, .h-captcha, #px-captcha, [class*="datadome" i], #cf-please-wait',
       );
-      return { t, body, hasPassword, challengeDom };
+      return { t, body, hasPassword, hasMfa, challengeDom };
     })
-    .catch(() => ({ t: "", body: "", hasPassword: false, challengeDom: false }));
+    .catch(() => ({ t: "", body: "", hasPassword: false, hasMfa: false, challengeDom: false }));
 
   const u = url.toLowerCase();
   const challTitle = /just a moment|checking your browser|one moment please|verifying you|attention required/.test(sig.t);
@@ -147,14 +141,11 @@ export async function classifyEmpty(page: Page, url: string): Promise<ApplyIssue
   if ([challTitle, challUrl, sig.challengeDom, challText].filter(Boolean).length >= 2) {
     return { level: "block", code: "bot-challenge", message: "This page is asking you to verify you're human before showing the form. Open it directly in your browser, complete the check, then paste the URL back here." };
   }
-  if (sig.hasPassword || /\/(login|sign-?in|register|sign-?up|auth|account|mfa|2fa)(\/|$|\?)/.test(u)) {
+  if (sig.hasPassword || sig.hasMfa || /\/(login|sign-?in|register|sign-?up|auth|account|mfa|2fa)(\/|$|\?)/.test(u)) {
     return { level: "block", code: "login-wall", message: "This page wants you to sign in or create an account first. Open it directly, log in, then paste the actual application-form URL here." };
   }
   if (/no longer accepting|position has been filled|posting is closed|no longer available|this (job|position|posting) (is |has )?(closed|expired|been filled)/.test(sig.body) || /not found|no longer|removed|closed/.test(sig.t)) {
     return { level: "block", code: "expired", message: "This job posting is closed or expired — it's no longer accepting applications." };
-  }
-  if (/myworkdayjobs\.com$/i.test(host)) {
-    return { level: "block", code: "workday", message: "Workday forms aren't supported for in-app fill yet (multi-step, account-gated). Open the posting and apply there directly." };
   }
   if (/^(jobs|careers|empleos|empregos|all jobs|open (positions|roles)|search jobs|current openings)/i.test(sig.t) || /\/(jobs|careers|search|positions)\/?(\?|$)/.test(u)) {
     return { level: "block", code: "listing-page", message: "This looks like the careers listing, not a single application — the posting may have moved or closed. Open the specific job and paste its “Apply” URL." };
@@ -210,50 +201,82 @@ export async function multiStepInfo(page: Page): Promise<ApplyIssue | null> {
 /** READ THE REAL FORM BACK after filling: did every answer land? required fields
  *  still empty? any validation error visible? — the self-verification a blind
  *  selector script can't do. Returns warnings to show BEFORE the human submits. */
-export async function verifyFill(frame: Frame, fields: ApplyField[], answers: Record<string, string>): Promise<ApplyIssue[]> {
-  const meta = fields.map((f) => ({ id: f.id, label: f.label || "this field", type: f.type, required: !!f.required, combobox: !!f.combobox }));
-  type R = { mismatches: string[]; requiredEmpty: string[]; valErrors: string[] };
+export type FieldVerification = { fieldId: string; label: string; status: "verified" | "mismatch" | "unverified"; intended?: string; actual?: string };
+
+export async function verifyFillDetailed(frame: Frame, fields: ApplyField[], answers: Record<string, string>): Promise<{ outcomes: FieldVerification[]; issues: ApplyIssue[] }> {
+  const meta = fields.map((f) => ({ id: f.id, label: f.label || "this field", type: f.type, required: !!f.required, combobox: !!f.combobox, nativeId: f.nativeId, uploadedFileName: f.uploadedFileName }));
+  type R = { outcomes: FieldVerification[]; requiredEmpty: string[]; valErrors: string[] };
   const res = await frame
     .evaluate(
       ({ meta, answers }): R => {
         const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-        const mismatches: string[] = [];
+        const truthy = (s: string | undefined) => ["true", "1", "yes", "on", "checked"].includes(norm(s));
+        const outcomes: FieldVerification[] = [];
         const requiredEmpty: string[] = [];
         for (const f of meta) {
           const intended = answers[f.id];
           const el = document.querySelector(`[data-co-field="${f.id}"]`) as HTMLElement | null;
-          if (!el) continue;
+          if (f.type === "file" && f.uploadedFileName && f.nativeId) {
+            const group = document.querySelector(`[role="group"][aria-labelledby="upload-label-${CSS.escape(f.nativeId)}"]`);
+            const receipt = group?.querySelector('.file-upload__filename p') as HTMLElement | null;
+            if (receipt?.offsetParent !== null && receipt?.textContent?.trim() === f.uploadedFileName) {
+              outcomes.push({ fieldId: f.id, label: f.label, status: "verified", actual: f.uploadedFileName });
+              continue;
+            }
+          }
+          if (!el) {
+            if (f.required) requiredEmpty.push(`${f.label} (control disappeared)`);
+            outcomes.push({ fieldId: f.id, label: f.label, status: "unverified", intended });
+            continue;
+          }
           if (f.type === "file") {
             // confirm a file actually landed on the input (the CV attach can fail
             // silently on a custom dropzone). Only warn if the field is required.
             const filesEl = el as HTMLInputElement;
             const has = !!(filesEl.files && filesEl.files.length > 0);
             if (f.required && !has) requiredEmpty.push(f.label);
+            outcomes.push({ fieldId: f.id, label: f.label, status: has ? "verified" : "unverified", actual: has ? filesEl.files?.[0]?.name : "" });
             continue;
           }
-          let actual = "";
+          let actual: string | null = "";
           if (f.type === "checkbox") {
             actual = (el as HTMLInputElement).checked ? "true" : "";
           } else if (f.type === "radio") {
             const grp = Array.from(document.querySelectorAll(`[data-co-field="${f.id}"]`)) as HTMLInputElement[];
-            actual = grp.some((r) => r.checked) ? "checked" : "";
+            const checked = grp.find((r) => r.checked);
+            actual = checked?.getAttribute("data-co-option") || checked?.value || "";
           } else if (f.combobox) {
             // react-select keeps the chosen value in a sibling .select__single-value
-            // (the tagged input stays empty). Read leniently: only conclude "empty"
-            // when a placeholder is visibly shown — otherwise assume OK (never a
-            // false "didn't land" warning).
+            // (the tagged input stays empty). An unreadable widget is reported as
+            // unverified rather than treated as a successful fill.
             const shell = el.closest('[class*="select-shell" i], [class*="select__container" i], [class*="select__control" i], [class*="value-container" i]') || el.parentElement?.parentElement || el.parentElement;
             const sv = shell?.querySelector('.select__single-value, [class*="single-value" i], [class*="singleValue" i], [class*="multi-value" i]');
             const ph = shell?.querySelector('.select__placeholder, [class*="placeholder" i]');
             const svText = (sv?.textContent || "").trim();
-            if (svText) actual = svText; // a value is shown
+            const flag = sv?.querySelector('.iti__flag');
+            const region = Array.from(flag?.classList || []).map(c => c.match(/^iti__([a-z]{2})$/)?.[1]).find(Boolean);
+            if (region) actual = new Intl.DisplayNames(["en"], { type: "region" }).of(region.toUpperCase()) || svText;
+            else if (svText) actual = svText;
             else if (ph && (ph as HTMLElement).offsetParent !== null) actual = ""; // placeholder visible → empty
-            else actual = intended || "ok"; // can't read reliably → don't flag
+            else actual = null; // an unreadable custom widget is never claimed as verified
+          } else if (f.type === "select") {
+            const select = el as HTMLSelectElement;
+            actual = select.selectedOptions?.[0]?.textContent?.trim() || select.value || "";
           } else {
             actual = (el as HTMLInputElement).value || "";
           }
-          if (intended && intended.trim() && !norm(actual)) mismatches.push(f.label);
-          else if (f.required && !norm(actual) && !(intended && intended.trim())) requiredEmpty.push(f.label);
+          if (actual === null) {
+            outcomes.push({ fieldId: f.id, label: f.label, status: "unverified", intended });
+          } else if (intended && intended.trim()) {
+            const phone = f.type === "tel" || el.getAttribute("type") === "tel";
+            const digits = (v: string) => v.replace(/[\s().-]/g, "");
+            const matches = f.type === "checkbox" ? truthy(actual) === truthy(intended)
+              : phone ? digits(actual) === digits(intended) : norm(actual) === norm(intended);
+            outcomes.push({ fieldId: f.id, label: f.label, status: matches ? "verified" : "mismatch", intended, actual });
+          } else {
+            outcomes.push({ fieldId: f.id, label: f.label, status: norm(actual) ? "verified" : "unverified", actual });
+          }
+          if (f.required && !norm(actual) && !(intended && intended.trim())) requiredEmpty.push(f.label);
         }
         const errSel = '[aria-invalid="true"], [role="alert"], [class*="error" i]:not([class*="clear" i]):not([class*="error-free" i])';
         const valErrors: string[] = [];
@@ -261,15 +284,22 @@ export async function verifyFill(frame: Frame, fields: ApplyField[], answers: Re
           const txt = (e.textContent || "").replace(/\s+/g, " ").trim();
           if (txt && txt.length > 2 && txt.length < 160 && e.offsetParent !== null) valErrors.push(txt);
         }
-        return { mismatches, requiredEmpty, valErrors: Array.from(new Set(valErrors)).slice(0, 5) };
+        return { outcomes, requiredEmpty, valErrors: Array.from(new Set(valErrors)).slice(0, 5) };
       },
       { meta, answers },
     )
-    .catch(() => ({ mismatches: [], requiredEmpty: [], valErrors: [] }) as R);
+    .catch(() => ({ outcomes: fields.map((f) => ({ fieldId: f.id, label: f.label || "this field", status: "unverified" as const, intended: answers[f.id] })), requiredEmpty: [], valErrors: ["Unable to re-read the form state"] }) as R);
 
   const out: ApplyIssue[] = [];
-  if (res.mismatches.length) out.push({ level: "warn", code: "fill-mismatch", message: `These answers didn't seem to land on the real form — check them: ${res.mismatches.slice(0, 4).join(", ")}${res.mismatches.length > 4 ? "…" : ""}.` });
+  const mismatches = res.outcomes.filter((result) => result.status === "mismatch");
+  const unverified = res.outcomes.filter((result) => result.status === "unverified" && answers[result.fieldId]);
+  if (mismatches.length) out.push({ level: "warn", code: "fill-mismatch", message: `These answers differ from the intended values — check them: ${mismatches.slice(0, 4).map((x) => x.label).join(", ")}${mismatches.length > 4 ? "…" : ""}.` });
+  if (unverified.length) out.push({ level: "warn", code: "fill-unverified", message: `These answers could not be verified on the live form: ${unverified.slice(0, 4).map((x) => x.label).join(", ")}${unverified.length > 4 ? "…" : ""}.` });
   if (res.requiredEmpty.length) out.push({ level: "warn", code: "required-empty", message: `Required and still empty — you'll need to fill ${res.requiredEmpty.length > 1 ? "these" : "this"}: ${res.requiredEmpty.slice(0, 4).join(", ")}${res.requiredEmpty.length > 4 ? "…" : ""}.` });
   for (const v of res.valErrors) out.push({ level: "warn", code: "validation", message: `The form flagged: “${v}”.` });
-  return out;
+  return { outcomes: res.outcomes, issues: out };
+}
+
+export async function verifyFill(frame: Frame, fields: ApplyField[], answers: Record<string, string>): Promise<ApplyIssue[]> {
+  return (await verifyFillDetailed(frame, fields, answers)).issues;
 }

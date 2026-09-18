@@ -22,10 +22,12 @@ type ApplyCtx = {
   issues: ApplyIssue[];
   driveSteps: DriveStep[];
   error: string;
+  canAdvance: boolean;
   open: (url: string, opts?: { prefill?: boolean; company?: string }) => Promise<void>;
   prefill: () => Promise<void>;
   setAnswer: (idOrLabel: string, value: string) => void;
   fill: () => Promise<void>;
+  advance: () => Promise<void>;
   agentFill: () => Promise<void>;
   reset: () => void;
 };
@@ -60,6 +62,7 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
   const [issues, setIssues] = useState<ApplyIssue[]>([]);
   const [driveSteps, setDriveSteps] = useState<DriveStep[]>([]);
   const [error, setError] = useState("");
+  const [canAdvance, setCanAdvance] = useState(false);
   const sessionId = useRef<string | null>(null);
   const companyRef = useRef<string>("");
   const fieldsRef = useRef<ApplyField[]>([]);
@@ -75,6 +78,7 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
   // session when it succeeds → fields ready → auto-prefill fires.
   const drive = useCallback(async (id: string) => {
     setDriveSteps([]);
+    setCanAdvance(false);
     try {
       const r = await fetch("/api/apply/drive", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: id, cliId: cliId(), goal: "reach" }) });
       if (!r.body) {
@@ -265,6 +269,7 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       setSteps(d.steps ?? []);
+      setCanAdvance(!d.navigated);
       // merge the verify-after-fill warnings (required-empty / mismatch / validation)
       if (Array.isArray(d.issues) && d.issues.length) {
         setIssues((prev) => {
@@ -288,6 +293,34 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
     }
   }, [answers, fields]);
 
+  const advance = useCallback(async () => {
+    if (!sessionId.current) return;
+    setStatus("filling");
+    setError("");
+    try {
+      const r = await fetch("/api/apply/advance", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: sessionId.current }) });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || "Could not inspect the next step");
+      if (Array.isArray(d.issues) && d.issues.length) setIssues((prev) => [...prev, ...d.issues]);
+      if (d.state === "form" && d.advanced && Array.isArray(d.fields) && d.fields.length) {
+        setFields(d.fields);
+        setAnswers({});
+        setMeta({});
+        setSteps([]);
+        pendingPrefill.current = true;
+        setCanAdvance(true);
+        setStatus("ready");
+        return;
+      }
+      if (d.state === "blocked") setError("The site did not advance safely. Check the visible form for validation messages.");
+      setCanAdvance(false);
+      setStatus("done");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not inspect the next step.");
+      setStatus("done");
+    }
+  }, []);
+
   // FULL-AGENT FILL — the agent fills the real form turn-by-turn from the verified
   // answers, streamed (drive panel), never submits, then hands off. Used as the
   // escalation when deterministic fill fails, or on demand.
@@ -298,6 +331,7 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
     const ans = fs.filter((f) => f.type !== "file" && (a[f.id] || "").trim()).map((f) => ({ label: f.label || f.id, value: a[f.id] }));
     setDriveSteps([]);
     setError("");
+    setCanAdvance(false);
     setStatus("filling");
     try {
       const r = await fetch("/api/apply/drive", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: sessionId.current, cliId: cliId(), goal: "full", answers: ans }) });
@@ -363,11 +397,12 @@ export function ApplyProvider({ children }: { children: React.ReactNode }) {
     setIssues([]);
     setDriveSteps([]);
     setError("");
+    setCanAdvance(false);
   }, []);
 
   const value = useMemo(
-    () => ({ status, url, title, company, fields, answers, meta, steps, shots, prefillLog, issues, driveSteps, error, open, prefill, setAnswer, fill, agentFill, reset }),
-    [status, url, title, company, fields, answers, meta, steps, shots, prefillLog, issues, driveSteps, error, open, prefill, setAnswer, fill, agentFill, reset],
+    () => ({ status, url, title, company, fields, answers, meta, steps, shots, prefillLog, issues, driveSteps, error, canAdvance, open, prefill, setAnswer, fill, advance, agentFill, reset }),
+    [status, url, title, company, fields, answers, meta, steps, shots, prefillLog, issues, driveSteps, error, canAdvance, open, prefill, setAnswer, fill, advance, agentFill, reset],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
