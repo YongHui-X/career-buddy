@@ -1,4 +1,4 @@
-import { fillSession, handoffSession, getSession } from "@/lib/apply/session";
+import { fillSession, handoffSession, getSession, type Preauthorize } from "@/lib/apply/session";
 import { resolveTailoredCv, resolveTailoredCvArtifact, companyFromTitle } from "@/lib/apply/cv";
 import type { ApplyField } from "@/lib/apply/extract";
 import { applyApiDisabled } from "@/lib/apply/api-guard";
@@ -12,7 +12,7 @@ export const maxDuration = 120;
 // so the HUMAN reviews and submits. NEVER submits — there is no submit path here.
 export async function POST(req: Request) {
   const disabled = applyApiDisabled(); if (disabled) return disabled;
-  let body: { sessionId?: string; answers?: Record<string, string>; fields?: ApplyField[]; handoff?: boolean; company?: string; cvArtifact?: string };
+  let body: { sessionId?: string; answers?: Record<string, string>; fields?: ApplyField[]; handoff?: boolean; company?: string; cvArtifact?: string; preauthorize?: Preauthorize };
   try {
     body = await req.json();
   } catch {
@@ -27,7 +27,10 @@ export async function POST(req: Request) {
   const cvPath = resolveTailoredCvArtifact(body.cvArtifact) ?? resolveTailoredCv(company) ?? resolveTailoredCv(companyFromTitle(session?.title)) ?? undefined;
 
   try {
-    const result = await fillSession(sessionId, answers, fields, cvPath);
+    // Pre-authorization is opt-in per REQUEST and fails closed when absent, so
+    // the interactive /apply UI (which never sends it) keeps refusing consent
+    // checkboxes exactly as before.
+    const result = await fillSession(sessionId, answers, fields, cvPath, body.preauthorize);
     const resumeSteps = result.steps.filter((step) => /\(CV attached\)$/.test(step.label));
     const cvAttached = !!cvPath && resumeSteps.length > 0 && resumeSteps.every((step) => step.ok);
     if (handoff) await handoffSession(sessionId).catch(() => {});

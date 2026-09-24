@@ -453,6 +453,20 @@ export async function closeSession(id: string): Promise<void> {
 
 export type FillStep = { fieldId: string; label: string; ok: boolean; thumb?: string };
 
+/** Explicit permission to accept consent checkboxes / required attestations
+ *  without a human present. Set from config/profile.yml
+ *  `automation.preauthorize` and carried over HTTP by the unattended worker.
+ *  Interactive callers (the /apply UI) never send it. */
+export type Preauthorize = { consentCheckboxes?: boolean; attestations?: boolean };
+
+/** Read one flag. Only a literal `true` grants permission: an absent object, a
+ *  missing key, `false`, or a truthy STRING (the shape a hand-edited JSON body
+ *  most easily produces) all mean refuse. A malformed request must never be
+ *  able to auto-attest on someone's behalf. */
+function preauthorized(p: Preauthorize | undefined, key: keyof Preauthorize): boolean {
+  return p?.[key] === true;
+}
+
 /** True for a file field that wants the candidate's résumé/CV (vs. cover letter,
  *  portfolio, or a generic attachment we leave for the user). */
 function isResumeField(f: ApplyField): boolean {
@@ -544,11 +558,15 @@ export async function fillSession(
   answers: Record<string, string>,
   fieldsMeta: ApplyField[],
   cvPath?: string,
-): Promise<{ steps: FillStep[]; navigated: boolean; issues: ApplyIssue[]; verification: FieldVerification[] }> {
+  preauth?: Preauthorize,
+): Promise<{ steps: FillStep[]; navigated: boolean; issues: ApplyIssue[]; verification: FieldVerification[]; consentAccepted: string[] }> {
   const s = SESSIONS.get(id);
   if (!s) throw new Error("apply session not found (it may have expired)");
   const byId = new Map(fieldsMeta.map((f) => [f.id, f]));
   const steps: FillStep[] = [];
+  // Every consent ticked on the user's behalf, recorded verbatim so the
+  // application's audit record shows exactly what was accepted for them.
+  const consentAccepted: string[] = [];
   // Belt-and-suspenders: if filling ever navigates the page (i.e. something got
   // submitted), the URL path changes. We never submit by construction, but we
   // report it so the caller can flag it instead of silently "succeeding".
@@ -601,12 +619,19 @@ export async function fillSession(
     const value = (raw ?? "").toString();
     if (!meta || value === "") continue;
     if (meta.type === "file") continue; // handled above (CV) — never auto-fill other uploads
-    // Defense-in-depth: NEVER auto-tick a legal consent/agreement checkbox — the
-    // human must affirmatively accept. (The planner already flags these
-    // needs_confirmation; this guarantees it even if it slips.)
+    // Defense-in-depth: never auto-tick a legal consent/agreement checkbox
+    // unless the user has EXPLICITLY pre-authorized it. The default is still
+    // refuse, and the interactive /apply path never sends the flag, so its
+    // behaviour is unchanged. (The planner also flags these
+    // needs_confirmation; this is the guarantee even if that slips.)
     if (meta.type === "checkbox" && /\b(i (have )?read|i agree|i consent|i accept|consent to|privacy notice|terms|gdpr|data protection)\b/i.test(meta.label || "")) {
-      steps.push({ fieldId: fid, label: `${meta.label} — you confirm`, ok: false, thumb: undefined });
-      continue;
+      if (!preauthorized(preauth, "consentCheckboxes")) {
+        steps.push({ fieldId: fid, label: `${meta.label} — you confirm`, ok: false, thumb: undefined });
+        continue;
+      }
+      // Recorded verbatim so the application's audit record shows exactly what
+      // was accepted in the user's name.
+      consentAccepted.push(meta.label || fid);
     }
     let ok = false;
     let gaveUp = false;
@@ -702,7 +727,7 @@ export async function fillSession(
     outcomes: verification.fields.map((field) => ({ fieldId: field.id, label: field.label, status: "unverified" as const, intended: verification.answers[field.id] })),
     issues: [{ level: "warn" as const, code: "verification-failed", message: "Could not verify the filled form." }],
   }));
-  return { steps, navigated: endPath !== startPath, issues: verified.issues, verification: verified.outcomes };
+  return { steps, navigated: endPath !== startPath, issues: verified.issues, verification: verified.outcomes, consentAccepted };
 }
 
 export type ApplyStepState = "form" | "review" | "complete" | "blocked";
@@ -792,6 +817,8 @@ export type SubmitResult = {
   reason?: string;
   receipt?: { url: string; title: string; confirmation: string };
   screenshot?: string;
+  /** Attestations accepted under pre-authorization, recorded verbatim. */
+  attestationsAccepted?: string[];
 };
 
 export async function captureSession(id: string, category = "blocked"): Promise<string | undefined> {
@@ -841,6 +868,7 @@ export async function submitSession(
   fields: ApplyField[],
   expectedCompany: string,
   expectedRole: string,
+  preauth?: Preauthorize,
 ): Promise<SubmitResult> {
   const s = SESSIONS.get(id);
   if (!s) return { status: "failed", reason: "apply session not found or expired" };
@@ -853,8 +881,14 @@ export async function submitSession(
   const adapter = adapterFor(s.page.url() || s.url);
   if (!adapter.submission) return stop("blocked", `${adapter.vendor} is discovery-only; automatic submission requires an employer-hosted supported ATS`);
   if (!s.cvMetadata) return stop("blocked", "No browser-verified tailored CV upload is present in this application session");
-  const attestation = fields.find((f) => f.required && attestationMatches(f.label || ""));
-  if (attestation) return stop("blocked", `Required attestation needs human confirmation: ${attestation.label}`);
+  // A required attestation ("I certify the above is true and complete") is a
+  // statement made in the candidate's name, so it stays blocked unless they
+  // pre-authorized it explicitly — a separate flag from consent, because
+  // agreeing to a privacy notice and certifying a claim are different acts.
+  const attestations = fields.filter((f) => f.required && attestationMatches(f.label || ""));
+  if (attestations.length && !preauthorized(preauth, "attestations")) {
+    return stop("blocked", `Required attestation needs human confirmation: ${attestations[0].label}`);
+  }
 
   const pageIdentity = await s.page.evaluate(() => `${document.title}\n${(document.body?.innerText || "").slice(0, 6000)}`).catch(() => s.title);
   if (!identityMatches(pageIdentity, expectedCompany) || !identityMatches(pageIdentity, expectedRole)) {
@@ -895,8 +929,9 @@ export async function submitSession(
   })).catch(() => ({ url: s.page.url(), title: "", confirmation: "" }));
 
   if (confirmationMatches(receipt.confirmation) || confirmationMatches(receipt.title)) {
+    const accepted = attestations.map((f) => f.label || f.id);
     await closeSession(id);
-    return { status: "submitted", receipt };
+    return { status: "submitted", receipt, attestationsAccepted: accepted };
   }
   return stop("submission_unknown", "Submit was clicked but no reliable confirmation receipt was detected; automatic retry is disabled", receipt);
 }

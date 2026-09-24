@@ -37,6 +37,17 @@ jds/*
 *简历*
 *学位*
 *成绩单*
+*resume*
+*resumé*
+*curriculum*
+*cover-letter*
+*linkedin*
+*portfolio*
+*statement-of-purpose*
+*transcript*
+*driver-license*
+*id-card*
+*ssn*
 
 # Interview prep (accumulated STAR+R stories — user data)
 interview-prep/*
@@ -209,3 +220,12 @@ documents/*
 # Intake fingerprints — the recorded source filenames may themselves carry
 # PII (e.g. cv/jane-doe-master-cv.pdf). #1723
 data/intake-state.json
+
+# ── Fork-local personal material (see config/local-paths.txt) ───────────────
+# Saved postings from before the pipeline existed, and notes from the earlier
+# "hermes" iteration. Personal data must not be committed to a public fork; the
+# upstream no-user-data CI gate only watches data/, jds/, reports/ and output/,
+# so these paths need their own entries.
+/job_listings/
+/job_descriptions/
+/hermes.md

@@ -28,6 +28,15 @@ export function isDirectAtsUrl(value = '') {
   }
 }
 
+/**
+ * The OpenRouter-era model gate. Kept only so an old .env that still pins
+ * CAREER_OPS_MODEL keeps failing the same way it used to; the worker no longer
+ * calls it. The backend check is now assertSubmissionBackend() in
+ * automation/model.mjs, which requires the configured CLI to resolve to a real
+ * executable — the CLI-backend equivalent of "not an unusable model".
+ *
+ * @deprecated Use assertSubmissionBackend from automation/model.mjs.
+ */
 export function assertSubmissionModel(model = process.env.CAREER_OPS_MODEL || '') {
   const value = String(model).trim();
   if (!value) throw new Error('CAREER_OPS_MODEL is required');
@@ -62,7 +71,25 @@ export function automationPolicy(profile = {}) {
     directAtsScan: cfg.direct_ats_scan !== false,
     dailyModelBudgetUsd: Number.isFinite(Number(cfg.daily_model_budget_usd))
       ? Math.max(0, Number(cfg.daily_model_budget_usd)) : 0.25,
+    // The local agent CLI that replaces OpenRouter for evaluation and CV
+    // tailoring. Resolved to an executable by lib/cli-resolve.mjs.
+    modelCli: typeof cfg.model_cli === 'string' && cfg.model_cli.trim() ? cfg.model_cli.trim() : 'claude',
+    // Replaces daily_model_budget_usd: a local CLI exposes no spend figure, so
+    // the ceiling is a CALL COUNT over data/automation-events.jsonl. Defaults to
+    // a real number rather than Infinity — an unattended loop with no ceiling is
+    // what the OpenRouter budget guard existed to prevent.
+    maxModelCallsPerDay: Number.isFinite(Number(cfg.max_model_calls_per_day))
+      ? Math.max(1, Number(cfg.max_model_calls_per_day)) : 60,
     savedAnswers: profile.application_answers || {},
+    candidate: profile.candidate || {},
+    // Explicit, opt-in permission to accept consent checkboxes and attestations
+    // without a human. Each flag must be exactly `true`: an absent block, a
+    // false, or a truthy string all mean REFUSE, so a malformed config can never
+    // auto-attest. See modes/_custom.md for the recorded policy.
+    preauthorize: {
+      consent_checkboxes: cfg.preauthorize?.consent_checkboxes === true,
+      attestations: cfg.preauthorize?.attestations === true,
+    },
   };
 }
 

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { isMainModule } from '../lib/is-main-module.mjs';
 
 const form = (scenario, body, action = '/receipt') => `<!doctype html><html><head><title>Acme - Software Engineer</title></head><body data-scenario="${scenario}"><h1>Software Engineer at Acme</h1><form method="post" action="${action}">${body}<button type="submit">Submit application</button></form></body></html>`;
 const baseFields = '<label>Full name <input name="name" required></label><label>Email <input type="email" name="email" required></label><label>Resume <input type="file" name="resume" required></label>';
@@ -32,7 +33,10 @@ export async function startFixtureServer() {
   return { server, baseUrl: `http://127.0.0.1:${address.port}` };
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+// Hand-rolled `file://${process.argv[1]}` comparisons silently no-op through a
+// symlinked checkout (#3170), which is why tests/main-guard-convention.test.mjs
+// forbids them. Use the shared helper.
+if (isMainModule(import.meta.url)) {
   const { baseUrl } = await startFixtureServer();
   console.log(`automation fixture server: ${baseUrl}`);
 }

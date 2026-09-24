@@ -98,18 +98,22 @@
 
 ## What Is This
 
-career-ops ([career-ops.org](https://career-ops.org), also known as **careerops**) is an open-source AI job search that runs locally inside any AI coding CLI: it evaluates offers, tailors your CV and tracks every application, and you always have the final call. Instead of manually tracking applications in a spreadsheet, you get an AI-powered pipeline that:
+This project is an automated job application and job-search assistant. The goal is to reduce the manual grind of finding roles, evaluating whether they fit, tailoring a CV, tracking applications, and helping move a candidate closer to an actual submission without losing human review. In short: it tries to automate the repetitive parts of the job hunt while keeping the applicant in the loop for final decisions.
 
-- **Evaluates offers** into a structured report -- blocks A through H, with a global 1-5 score reached by holistic judgement across five dimensions rather than an arithmetic formula. Block B's per-requirement importance column and block G's posting-legitimacy assessment are both separate, score-neutral signals that never affect the score; block H is drafted only at 4.5 and above
-- **Generates tailored PDFs** -- ATS-optimized CVs customized per job description
-- **Scans portals** automatically (Greenhouse, Ashby, Lever, company pages)
-- **Processes in batch** -- evaluate 10+ offers in parallel with sub-agents
-- **Tracks everything** in a single source of truth with integrity checks
-- **Researches companies and finds the right person to contact** -- applications get you in the queue; research gets you a conversation
+This repository is built on top of the original CareerOps project by Santiago Fernández and the broader CareerOps ecosystem. We credit CareerOps as the original source and foundation for this work, and this project extends that idea with its own automation-focused workflow, application assistance, and tooling around the job pipeline.
 
-> **Important: This is NOT a spray-and-pray tool.** career-ops is a filter -- it helps you find the few offers worth your time out of hundreds. The system strongly recommends against applying to anything scoring below 4.0/5. Your time is valuable, and so is the recruiter's. Always review before submitting.
+The project is designed to work locally inside an AI coding CLI and to help with:
 
-career-ops is agentic: whichever AI coding CLI you choose navigates career pages with Playwright, evaluates fit by reasoning about your CV vs the job description (not keyword matching), and adapts your resume per listing.
+- **Evaluating jobs** against your CV and target profile
+- **Tailoring resumes and application materials** to each posting
+- **Scanning job boards and company pages** for relevant openings
+- **Tracking a pipeline** of applications, statuses, and follow-ups
+- **Helping automate repetitive application tasks** while keeping a human review step
+- **Researching companies and identifying the right contact** when outreach is appropriate
+
+> **Important: This is NOT a spray-and-pray tool.** The idea is to filter toward the roles worth your time, not to blast out low-fit applications. The system strongly recommends against applying to anything scoring below 4.0/5. Your time is valuable, and so is the recruiter's. Always review before submitting.
+
+This project follows the same core idea as CareerOps: use AI to reason about fit, optimize the job search process, and make the candidate more effective. It is not a replacement for the original project; it is a build on top of it, adapted toward more automated application workflows and local tooling.
 
 > **Heads up: the first evaluations won't be great.** The system doesn't know you yet. Feed it context -- your CV, your career story, your proof points, your preferences, what you're good at, what you want to avoid. The more you nurture it, the better it gets. Think of it as onboarding a new recruiter: the first week they need to learn about you, then they become invaluable.
 

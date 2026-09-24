@@ -409,6 +409,58 @@ Headless worker command per CLI:
 
 **Parallel fan-outs — reserve report numbers first.** Before spawning N parallel evaluators, reserve the range: `node reserve-report-num.mjs --count N` (prints e.g. `042-049`); hand each worker its own number. The allocator treats report files, sentinels, tracker row IDs, and tracker report links as occupied; each slot claim is individually atomic (on collision, claimed slots are released and the reservation restarts past it — permanent, harmless gaps). Release with `node reserve-report-num.mjs --release 042-049` when done; stale sentinels are GC'd after 4h, so reserve right before spawning. Never let parallel workers compute `max+1` themselves — that is the #749 race.
 
+## Unattended Automation (`automation/`) — FORK-LOCAL
+
+This checkout carries an unattended application worker that upstream does not
+ship. It is declared in `config/local-paths.txt`, so `update-system.mjs apply`
+leaves it alone. **It is the only path in the tree that submits an application
+without a human**, and it does so deliberately — see `modes/_custom.md` for the
+recorded override of the "career-ops never submits" default.
+
+| File | Role |
+|------|------|
+| `automation/worker.mjs` | The run loop: scan → queue → evaluate → tailor → gates → apply. Entry point for a single cycle. |
+| `automation/scheduler.mjs` | Daily `scan_time` run + `digest_time` roll-up, from `config/profile.yml`. |
+| `automation/local-supervisor.mjs` | Starts the local apply service on `127.0.0.1:3000` and the scheduler together; holds a PID lock. |
+| `automation/policy.mjs` | Every gate: eligibility, rollout ladder, retry, sensitive-field detection, pre-authorization normalization. |
+| `automation/state.mjs` | `data/automation-queue.json` + the append-only `data/automation-events.jsonl`, both written atomically under a lock. |
+| `automation/answers.mjs` | Deterministic form-answer resolution. **No fuzzy matching, by design** — see below. |
+| `automation/model.mjs` | Model backend: a LOCAL CLI (`automation.model_cli`), not OpenRouter. Plus the daily call-count budget guard. |
+| `automation/tailor.mjs` | CV tailoring: the CLI emits a `build-cv-html.mjs` payload, never raw HTML. |
+| `automation/notify.mjs` | Local-first notification. Telegram is optional and never gates a run. |
+| `automation-report.mjs` | Read-only: why applications did not go out, worst blocker first. |
+
+**Queue statuses** (`AUTOMATION_STATUSES` in `automation/policy.mjs`) — distinct from the
+tracker's canonical states: `discovered` → `evaluated` → `eligible` → `applying`
+→ `submitted`, plus `blocked`, `failed`, `submission_unknown`, `retry_wait`,
+`skipped`, and `unsupported_source` (an aggregator posting with no
+employer-hosted ATS URL — it needs a manual application).
+
+**Rules when working on this subsystem:**
+
+- **Answers are resolved, never guessed.** `automation/answers.mjs` matches a
+  form question by exact prior answer, then by curated INTENT patterns, then by
+  profile identity field — and then stops. Do not add a substring or fuzzy
+  fallback: the matcher it replaced answered "Do you manage a team?" with the
+  saved `age` value and submitted it. An unmatched question is reported.
+- **`CONFIRM_REQUIRED` is not a value.** A `config/profile.yml` answer reading
+  that sentinel is unresolved. Never send it to a form, never paraphrase around
+  it, never infer what it should have been.
+- **Consent and attestation need explicit pre-authorization.**
+  `automation.preauthorize.consent_checkboxes` / `.attestations` must be
+  literally `true`. Absent, false, or a truthy string all mean refuse, at every
+  layer (policy, resolver, `session.ts`, and both API routes). CAPTCHA, login
+  walls and MFA stay unconditional refusals regardless.
+- **The model backend is read-only.** `lib/cli-resolve.mjs` `plannerArgs()`
+  denies Bash/Write/Edit/Task/WebFetch/WebSearch and loads no MCP servers, and
+  the prompt travels on **stdin** — both because Windows caps a command line at
+  32,767 characters (an evaluation prompt exceeds it) and because untrusted JD
+  text must never reach a shell.
+- **Never remove a duplicate-application gate.** `submissionPolicyGate` is called
+  three times inside one `attemptApplication`, `identityMatches` fails closed on
+  a placeholder company/role, and `submission_unknown` is never retried. A
+  submitted application cannot be recalled.
+
 ## Stack and Conventions
 
 - Node.js (`.mjs`), Playwright (PDF + scraping), YAML (config), HTML/CSS (template), Markdown (data), Canva MCP (optional visual CV)
